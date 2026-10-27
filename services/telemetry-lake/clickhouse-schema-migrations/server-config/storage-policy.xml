@@ -1,0 +1,67 @@
+<!--
+  storage-policy.xml — production/staging ClickHouse storage-tiering config.
+
+  This is the real server config XML that
+  005_hot_tier_ttl_and_cold_tier_storage_policy.sql's header comment describes as a
+  prerequisite ("ClickHouse storage policies are NOT created by SQL — they're declared in
+  server config XML"). It was previously documented only in that comment; this file is the
+  actual, loadable artifact.
+
+  Authoritative naming: the policy name (`hot_to_cold_tiered`), disk names (`default`,
+  `cold_tier_s3`), and volume names (`hot`, `cold`) below MUST match the `storage_policy`
+  string referenced by migration 005's `ALTER TABLE ... MODIFY SETTING storage_policy = '...'`
+  and its `TTL ... TO VOLUME 'cold'` clause exactly, or ClickHouse rejects the ALTER at
+  startup/migration time. If you ever need to rename either side, treat THIS FILE as
+  authoritative (it is what ClickHouse itself validates against) and update migration 005's
+  SQL to match, not the other way around — the SQL migration only *references* a policy that
+  must already exist.
+
+  Deployment path: mounted into `/etc/clickhouse-server/config.d/storage-policy.xml` by
+  infrastructure/kubernetes/base/telemetry-clickhouse-statefulset.yaml (via a ConfigMap) for
+  staging/production. ClickHouse merges every file under `config.d/` into its main config, so
+  this fragment only needs the `<storage_configuration>` sub-tree, not a full server config.
+
+  Local dev uses storage-policy.local-dev.xml instead (local second disk, not S3) — see that
+  file and docker-compose.yml's telemetry-metrics-clickhouse service.
+-->
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <!-- Implicit `default` disk (local SSD/NVMe, ClickHouse's built-in default) is the
+                 hot volume's disk and does not need to be declared here. -->
+            <cold_tier_s3>
+                <type>s3</type>
+                <!-- Placeholder bucket/region — set to this environment's real cold-tier bucket
+                     via ops config management before applying. -->
+                <endpoint>https://s3.amazonaws.com/testforge-telemetry-cold-tier/</endpoint>
+                <!-- Uses the node's IAM role / instance profile (EKS IRSA, GKE Workload
+                     Identity, or equivalent) rather than static keys baked into config. If your
+                     environment instead needs static credentials, replace this with
+                     <access_key_id> / <secret_access_key> pulled from a Secret-mounted env var,
+                     never hardcoded here. -->
+                <use_environment_credentials>true</use_environment_credentials>
+            </cold_tier_s3>
+        </disks>
+        <policies>
+            <hot_to_cold_tiered>
+                <volumes>
+                    <hot>
+                        <disk>default</disk>
+                    </hot>
+                    <cold>
+                        <disk>cold_tier_s3</disk>
+                        <!-- Rows only move to cold via the TTL clause in migration 005, never
+                             immediately on insert. -->
+                        <perform_ttl_move_on_insert>0</perform_ttl_move_on_insert>
+                    </cold>
+                </volumes>
+                <!-- Safety valve, not the primary tiering mechanism: also spills hot->cold
+                     under local disk pressure before a part's TTL would otherwise move it, so a
+                     nearly-full hot volume degrades gracefully instead of failing inserts. See
+                     migration 005's trailing "Notes for future maintainers" for the full
+                     rationale. -->
+                <move_factor>0.1</move_factor>
+            </hot_to_cold_tiered>
+        </policies>
+    </storage_configuration>
+</clickhouse>

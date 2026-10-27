@@ -1,0 +1,89 @@
+image:
+  repository: ghcr.io/testforge/pipeline-api-gateway
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: pipeline-api-gateway
+  annotations: {}
+
+ports:
+  graphql: 4000
+  subscriptions: 4001
+
+service:
+  type: ClusterIP
+  graphqlPort: 80
+  subscriptionsPort: 4001
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 12
+  targetCPUUtilizationPercentage: 70
+  # No custom-metric scaling here, unlike protocol-load-worker-go — request
+  # volume against the gateway (test CRUD, run-status queries) doesn't spike
+  # in lockstep with a running load test the way execution-fleet capacity
+  # does, so plain CPU-based HPA is sufficient.
+
+env:
+  temporalAddress: "dag-workflow-scheduler-temporal-frontend.testforge-platform.svc.cluster.local:7233"
+  postgresSecretName: pipeline-api-gateway-db
+  postgresSecretKey: connection-string
+  # Read by opa-rego-policy-evaluator.adapter.ts (OPA_SIDECAR_BASE_URL). Points
+  # at the OPA sidecar in the same Pod, so this is always localhost regardless
+  # of environment — see opaSidecar below for the sidecar itself.
+  opaSidecarBaseUrl: "http://localhost:8181"
+
+# OPA (Open Policy Agent) sidecar: evaluates the Rego policy bundle from
+# services/orchestration-control-plane/pipeline-api-gateway/src/policy-gate/example-policies/
+# against every triggered run, called by opa-rego-policy-evaluator.adapter.ts
+# over its Data API (see ADR 0005). Bundle content is mounted in from the
+# opa-policy-bundle-configmap.yaml template, generated from those same
+# example-policies/*.rego files.
+opaSidecar:
+  enabled: true
+  image:
+    repository: openpolicyagent/opa
+    tag: "0.68.0"
+    pullPolicy: IfNotPresent
+  port: 8181
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+
+probes:
+  readiness:
+    path: /healthz/ready
+    initialDelaySeconds: 5
+  liveness:
+    path: /healthz/live
+    initialDelaySeconds: 10
+
+podAnnotations: {}
+podLabels: {}
+
+nodeSelector:
+  testforge.io/control-plane: "true"
+
+tolerations: []
+
+affinity: {}

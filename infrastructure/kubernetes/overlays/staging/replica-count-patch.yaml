@@ -1,0 +1,30 @@
+# Staging runs the smallest fleet that can still prove out a real pipeline
+# (checkout-load-test.yaml style DAGs at reduced VU counts) without paying
+# for idle production-sized capacity.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: protocol-load-worker-go
+spec:
+  replicas: 2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipeline-api-gateway
+spec:
+  replicas: 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dag-workflow-scheduler
+spec:
+  replicas: 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: environment-lifecycle-manager
+spec:
+  replicas: 1

@@ -1,0 +1,85 @@
+# Local development dependency stack for the distributed-testing-benchmarking-tool.
+# This brings up everything the control plane and telemetry lake need to run locally;
+# the execution-fleet workers connect to this stack the same way they'd connect to the
+# production Redpanda/Redis/ClickHouse endpoints, just via localhost.
+name: distributed-testing-benchmarking-tool
+
+services:
+  # --- Orchestration Control Plane state stores ---
+  test-definition-postgres:
+    image: postgres:16-alpine
+    container_name: test-definition-postgres
+    environment:
+      POSTGRES_DB: control_plane
+      POSTGRES_USER: control_plane
+      POSTGRES_PASSWORD: control_plane_dev_password
+    ports: ["5432:5432"]
+    volumes: [".docker-volumes/postgres:/var/lib/postgresql/data"]
+
+  coordinator-state-redis:
+    image: redis:7-alpine
+    container_name: coordinator-state-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: [".docker-volumes/redis:/data"]
+
+  dag-workflow-temporal:
+    image: temporalio/auto-setup:1.24
+    container_name: dag-workflow-temporal
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: control_plane
+      POSTGRES_PWD: control_plane_dev_password
+      POSTGRES_SEEDS: test-definition-postgres
+    ports: ["7233:7233"]
+    depends_on: [test-definition-postgres]
+
+  # --- Telemetry Lake ingestion + storage ---
+  telemetry-ingestion-redpanda:
+    image: redpandadata/redpanda:v24.2.4
+    container_name: telemetry-ingestion-redpanda
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 1G
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://telemetry-ingestion-redpanda:9092
+    ports: ["9092:9092"]
+
+  telemetry-metrics-clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    container_name: telemetry-metrics-clickhouse
+    ports: ["8123:8123", "9000:9000"]
+    volumes:
+      - ".docker-volumes/clickhouse:/var/lib/clickhouse"
+      # Cold tier for the hot_to_cold_tiered storage policy (see
+      # server-config/storage-policy.local-dev.xml) — a second, distinct bind mount so local
+      # dev exercises a real two-tier TTL-move policy instead of staying single-disk.
+      - ".docker-volumes/clickhouse-cold-tier:/var/lib/clickhouse/cold-tier"
+      - "./services/telemetry-lake/clickhouse-schema-migrations:/docker-entrypoint-initdb.d"
+      - "./services/telemetry-lake/clickhouse-schema-migrations/server-config/storage-policy.local-dev.xml:/etc/clickhouse-server/config.d/storage-policy.xml"
+
+  otel-collector-daemon:
+    image: otel/opentelemetry-collector-contrib:0.108.0
+    container_name: otel-collector-daemon
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - "./services/telemetry-lake/otel-collector-config/collector-config.yaml:/etc/otel-collector-config.yaml"
+    ports: ["4317:4317", "4318:4318"]
+    depends_on: [telemetry-ingestion-redpanda]
+
+  # --- Secrets ---
+  secret-injection-vault:
+    image: hashicorp/vault:1.17
+    container_name: secret-injection-vault
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: dev-root-token
+    ports: ["8200:8200"]
+    cap_add: ["IPC_LOCK"]
+
+networks:
+  default:
+    name: distributed-testing-benchmarking-tool-net

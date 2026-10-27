@@ -1,0 +1,51 @@
+// chaos_fault_injection.proto
+//
+// Wire contract for the `chaos.fault-injection-event.v1` Redpanda topic. Published by
+// `chaos-ebpf-sidecar` on every fault lifecycle transition; consumed by `dag-workflow-scheduler`
+// (to mark a CHAOS_INJECTION dag node complete) and by the telemetry lake (so
+// AbCanaryDifferentialBenchmarkComparator and dashboards can correlate latency/error spikes
+// against a fault's active window).
+//
+// Mirrors ChaosFaultInjectionEvent in
+// shared-libraries/redpanda-ingestion-pipeline/src/topic-definitions.ts field-for-field.
+
+syntax = "proto3";
+
+package testforge.protocol.chaos_fault_injection.v1;
+
+option go_package = "github.com/testforge/protocol-contracts/chaos_fault_injection;chaosfaultinjectionpb";
+
+enum ChaosFaultKind {
+  CHAOS_FAULT_KIND_UNSPECIFIED = 0;
+  CHAOS_FAULT_KIND_NETWORK_LATENCY = 1;
+  CHAOS_FAULT_KIND_PACKET_LOSS = 2;
+  CHAOS_FAULT_KIND_CPU_STARVATION = 3;
+  CHAOS_FAULT_KIND_MEMORY_PRESSURE = 4;
+  CHAOS_FAULT_KIND_PROCESS_KILL = 5;
+  CHAOS_FAULT_KIND_DISK_IO_THROTTLE = 6;
+}
+
+enum ChaosFaultLifecycleState {
+  CHAOS_FAULT_LIFECYCLE_STATE_UNSPECIFIED = 0;
+  CHAOS_FAULT_LIFECYCLE_STATE_SCHEDULED = 1;
+  CHAOS_FAULT_LIFECYCLE_STATE_ACTIVE = 2;
+  CHAOS_FAULT_LIFECYCLE_STATE_RECOVERED = 3;
+  CHAOS_FAULT_LIFECYCLE_STATE_ABORTED = 4;
+}
+
+message ChaosFaultInjectionEvent {
+  string pipeline_run_id = 1;
+  string dag_node_id = 2;
+  string fault_id = 3;
+
+  ChaosFaultKind fault_kind = 4;
+  ChaosFaultLifecycleState lifecycle_state = 5;
+
+  // Kernel-level target the eBPF program attached to (pod/container/interface identifier).
+  string target_identifier = 6;
+
+  // Fault-kind-specific magnitude, e.g. {"latencyMs": 250} or {"lossPercentage": 5}.
+  map<string, double> parameters = 7;
+
+  int64 occurred_at_unix_nano = 8;
+}

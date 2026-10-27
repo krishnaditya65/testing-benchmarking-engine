@@ -1,0 +1,10 @@
+# Caps staging's HPA well below production's 500-pod ceiling so a
+# misconfigured load test in a feature branch can't quietly burn the
+# staging cluster's node budget.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: protocol-load-worker-go
+spec:
+  minReplicas: 2
+  maxReplicas: 25

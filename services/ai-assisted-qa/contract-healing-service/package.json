@@ -1,0 +1,18 @@
+{
+  "name": "@ai-assisted-qa/contract-healing-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Autonomous Contract Healing: diffs OpenAPI/Protobuf schema versions, heals broken JSONPath data-extraction expressions in pipeline definitions, and drafts (or, above a confidence threshold, auto-applies) a source-control PR with the fix.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5",
+    "@types/node": "^20.14.10"
+  }
+}

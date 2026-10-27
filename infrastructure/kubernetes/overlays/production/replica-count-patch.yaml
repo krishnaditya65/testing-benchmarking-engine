@@ -1,0 +1,31 @@
+# Production baseline replicas. The worker fleet's real ceiling comes from
+# the base HorizontalPodAutoscaler (up to 500 pods on active-virtual-users);
+# this only sets the steady-state floor so a fresh rollout never scales
+# to zero between deploys.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: protocol-load-worker-go
+spec:
+  replicas: 10
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipeline-api-gateway
+spec:
+  replicas: 4
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dag-workflow-scheduler
+spec:
+  replicas: 5
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: environment-lifecycle-manager
+spec:
+  replicas: 3

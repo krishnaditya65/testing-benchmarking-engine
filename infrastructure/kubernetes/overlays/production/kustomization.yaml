@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: testforge-platform
+
+resources:
+  - ../../base
+
+patches:
+  - path: replica-count-patch.yaml
+  - path: control-plane-resources-patch.yaml
+  - path: clickhouse-cold-tier-volume-patch.yaml
+    target:
+      kind: StatefulSet
+      name: telemetry-metrics-clickhouse
+
+images:
+  - name: ghcr.io/testforge/protocol-load-worker-go
+    newTag: stable
+  - name: ghcr.io/testforge/chaos-ebpf-sidecar
+    newTag: stable
+  - name: ghcr.io/testforge/pipeline-api-gateway
+    newTag: stable
+  - name: ghcr.io/testforge/dag-workflow-scheduler
+    newTag: stable
+  - name: ghcr.io/testforge/environment-lifecycle-manager
+    newTag: stable
+
+commonLabels:
+  testforge.io/environment: production

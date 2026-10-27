@@ -1,0 +1,54 @@
+// dag_dispatch.proto
+//
+// Wire contract for the `dag.node.dispatch.v1` Redpanda topic — see ARCHITECTURE.md
+// "Communication contracts": control plane -> workers. Published by
+// `dag-workflow-scheduler` (Go), consumed by every execution-fleet worker
+// (protocol-load-worker-go, protocol-load-worker-rust, dag-ipld-benchmark-worker-rust,
+// chaos-ebpf-sidecar, wasm-payload-sandbox-runtime).
+//
+// This message mirrors DagNodeDispatchCommand in
+// shared-libraries/redpanda-ingestion-pipeline/src/topic-definitions.ts field-for-field. If you
+// change one, change both, and follow the compatibility review process in this directory's
+// README before merging.
+
+syntax = "proto3";
+
+package testforge.protocol.dag_dispatch.v1;
+
+option go_package = "github.com/testforge/protocol-contracts/dag_dispatch;dagdispatchpb";
+
+// Mirrors PipelineNode.kind in shared-libraries/dag-domain-model — keep enum values in sync.
+enum DagNodeKind {
+  DAG_NODE_KIND_UNSPECIFIED = 0;
+  DAG_NODE_KIND_API_REQUEST = 1;
+  DAG_NODE_KIND_LOAD_TEST = 2;
+  DAG_NODE_KIND_DATA_SEED = 3;
+  DAG_NODE_KIND_ASSERTION = 4;
+  DAG_NODE_KIND_CHAOS_INJECTION = 5;
+  DAG_NODE_KIND_ENVIRONMENT_TEARDOWN = 6;
+}
+
+// Published once per DAG node per pipeline run, once every one of its upstream dependencies
+// has reached a terminal state.
+message DagNodeDispatchCommand {
+  string pipeline_run_id = 1;
+  string dag_node_id = 2;
+  DagNodeKind node_kind = 3;
+
+  // Node ids that were required to reach a terminal state before this dispatch was issued.
+  // Present for audit/debugging; workers do not need to re-check this themselves.
+  repeated string upstream_node_ids = 4;
+
+  // Opaque, node-kind-specific configuration, JSON-encoded against the matching PipelineNode
+  // variant from shared-libraries/dag-domain-model (e.g. ApiRequestNode's fields for an
+  // API_REQUEST dispatch). Kept as a JSON string rather than a further nested proto message so
+  // new node kinds/fields can ship without a wire-format bump to this envelope.
+  string node_config_json = 5;
+
+  // Monotonically increasing per pipeline_run_id; workers use this for idempotent dedup if a
+  // dispatch is redelivered after a rebalance.
+  uint64 dispatch_sequence = 6;
+
+  int64 dispatched_at_unix_nano = 7;
+  int64 deadline_unix_nano = 8;
+}

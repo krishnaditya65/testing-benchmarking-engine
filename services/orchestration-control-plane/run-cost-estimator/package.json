@@ -1,0 +1,25 @@
+{
+  "name": "run-cost-estimator",
+  "version": "0.1.0",
+  "description": "Estimates the $ cost and approximate CO2 footprint of a pipeline run before it starts, from LoadTestNode worker-hours x instance-type pricing x cloud provider. Called by pipeline-api-gateway's cost-estimation port so the workflow-canvas-frontend can show projected cost before \"Run\" is clicked.",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/http/cost-estimate-http-server.ts",
+    "start": "node dist/http/cost-estimate-http-server.js",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@shared-libraries/dag-domain-model": "file:../../shared-libraries/dag-domain-model"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "eslint": "^8.57.0",
+    "tsx": "^4.7.2",
+    "typescript": "^5.4.5",
+    "vitest": "^2.0.5"
+  }
+}

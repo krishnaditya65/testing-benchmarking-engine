@@ -1,0 +1,155 @@
+# Example declarative pipeline definition, submitted via:
+#   testforge run --pipeline ./pipelines/checkout-load-test.yaml --environment staging
+#
+# DAG shape:
+#
+#   provision-checkout-environment
+#           │
+#           ▼
+#     smoke-test-checkout-api
+#           │
+#           ▼
+#     seed-checkout-order-history        (1M synthetic rows)
+#           │
+#           ▼
+#     load-test-checkout-flow            (50k concurrent virtual users)
+#           │
+#           ▼
+#     assert-order-ledger-consistency
+#           │
+#           ▼
+#     teardown-checkout-environment
+#
+apiVersion: testforge.io/v1
+kind: PipelineDefinition
+metadata:
+  name: checkout-load-test
+  description: >-
+    End-to-end load and consistency validation of the checkout service:
+    smoke-test the API surface, seed a production-scale order history,
+    drive 50k concurrent virtual users through the checkout flow, then
+    assert the order ledger is still consistent after sustained write
+    pressure.
+  owner: checkout-platform-team
+  labels:
+    testforge.io/pipeline-category: load-test
+    testforge.io/target-service: checkout-api
+
+spec:
+  nodes:
+    - id: provision-checkout-environment
+      type: environment-provision
+      config:
+        # Backed by infrastructure/crossplane's ephemeral namespace
+        # composition — see infrastructure/crossplane/README.md.
+        maxConcurrentVirtualUsers: 50000
+        ttlMinutes: 90
+
+    - id: smoke-test-checkout-api
+      type: api-smoke-test
+      dependsOn: [provision-checkout-environment]
+      config:
+        protocol: rest
+        baseUrl: https://checkout-api.internal.staging.testforge.io
+        requests:
+          - method: GET
+            path: /healthz
+            expectStatus: 200
+          - method: POST
+            path: /v1/carts
+            expectStatus: 201
+          - method: POST
+            path: /v1/checkout/quote
+            expectStatus: 200
+        maxDurationSeconds: 60
+
+    - id: seed-checkout-order-history
+      type: database-seed
+      dependsOn: [smoke-test-checkout-api]
+      config:
+        # Executed by test-data-factory-service
+        # (services/orchestration-control-plane/test-data-factory-service).
+        targetDatabase: checkout-orders-postgres
+        recordCount: 1000000
+        entity: order
+        piiMaskingProfile: standard
+        seedStrategy: bulk-copy-with-synthetic-pii
+
+    - id: load-test-checkout-flow
+      type: load-test
+      dependsOn: [seed-checkout-order-history]
+      config:
+        protocol: rest
+        targetService: checkout-api
+        baseUrl: https://checkout-api.internal.staging.testforge.io
+        virtualUsers:
+          rampUp:
+            fromUsers: 500
+            toUsers: 50000
+            durationMinutes: 10
+          sustain:
+            users: 50000
+            durationMinutes: 20
+          rampDown:
+            durationMinutes: 5
+        scenario:
+          - action: addToCart
+            weight: 40
+          - action: applyDiscountCode
+            weight: 15
+          - action: submitCheckout
+            weight: 35
+          - action: viewOrderConfirmation
+            weight: 10
+        workerPool: protocol-load-worker-go
+
+    - id: assert-order-ledger-consistency
+      type: database-consistency-assertion
+      dependsOn: [load-test-checkout-flow]
+      config:
+        targetDatabase: checkout-orders-postgres
+        checks:
+          - name: no-orphaned-line-items
+            query: >-
+              SELECT count(*) FROM order_line_items li
+              LEFT JOIN orders o ON o.id = li.order_id
+              WHERE o.id IS NULL
+            expect: "0"
+          - name: ledger-balance-matches-payment-totals
+            query: >-
+              SELECT count(*) FROM orders o
+              WHERE o.total_cents <> (
+                SELECT coalesce(sum(amount_cents), 0)
+                FROM payments p WHERE p.order_id = o.id
+              )
+            expect: "0"
+
+    - id: teardown-checkout-environment
+      type: environment-teardown
+      dependsOn: [assert-order-ledger-consistency]
+      config:
+        # Deletes the EphemeralTestNamespace Claim created by
+        # provision-checkout-environment, cascading to the namespace,
+        # ResourceQuota, and NetworkPolicies Crossplane composed for it.
+        force: false
+
+  qualityGates:
+    - name: checkout-p99-latency-under-load
+      metric: http.server.duration.p99
+      threshold: "750ms"
+      severity: blocking
+
+    - name: checkout-error-rate-under-load
+      metric: http.server.error_rate
+      threshold: "0.5%"
+      severity: blocking
+
+    - name: order-ledger-consistency
+      metric: database_consistency_assertion.failures
+      threshold: "0"
+      severity: blocking
+
+    - name: checkout-throughput-floor
+      metric: http.server.requests_per_second
+      threshold: ">=8000"
+      severity: warning

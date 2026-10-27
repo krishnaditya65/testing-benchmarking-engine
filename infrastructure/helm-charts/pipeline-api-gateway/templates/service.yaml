@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pipeline-api-gateway.fullname" . }}
+  labels:
+    {{- include "pipeline-api-gateway.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "pipeline-api-gateway.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http-graphql
+      port: {{ .Values.service.graphqlPort }}
+      targetPort: http-graphql
+    - name: ws-subscriptions
+      port: {{ .Values.service.subscriptionsPort }}
+      targetPort: ws-subscriptions
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "pipeline-api-gateway.serviceAccountName" . }}
+  labels:
+    {{- include "pipeline-api-gateway.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}

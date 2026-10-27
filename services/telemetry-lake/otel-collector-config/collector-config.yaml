@@ -1,0 +1,156 @@
+# OpenTelemetry Collector configuration for the telemetry-lake ingestion path.
+#
+# Deployed as a Kubernetes DaemonSet (one collector per node) so every
+# execution-fleet worker and control-plane process emits OTLP to a
+# collector on its own node instead of crossing node boundaries for the
+# first hop. See services/telemetry-lake/otel-collector-config/README.md
+# for the full pipeline explanation and feature-manifest mapping.
+#
+# Local dev: this exact file is mounted into the `otel-collector-daemon`
+# service in the repo-root docker-compose.yml.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        # Workers and control-plane services push traces/metrics/logs here.
+        # This is the "Workers -> telemetry lake" contract described in
+        # ARCHITECTURE.md ("Communication contracts").
+        endpoint: 0.0.0.0:4317
+      http:
+        # Used by browser-origin telemetry (workflow-canvas-frontend RUM)
+        # and any sidecar that cannot speak gRPC (e.g. chaos-ebpf-sidecar
+        # shelling out to a lightweight OTLP/HTTP exporter).
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batches spans/metrics/logs before export to amortize network overhead
+  # to Redpanda. Tuned small because this collector runs per-node (limited
+  # memory budget) and we want low end-to-end ingestion latency, not
+  # maximum batch size.
+  batch:
+    send_batch_size: 8192
+    send_batch_max_size: 16384
+    timeout: 5s
+
+  # Guards the collector's own memory before the batch queue can OOM the
+  # DaemonSet pod under a traffic spike (e.g. the 10M-RPS burst scenario
+  # the ingestion pipeline is designed to shed load gracefully for).
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 768
+    spike_limit_mib: 256
+
+  # Tail sampling: decisions are made only after a trace's spans have all
+  # arrived, so it can see the *outcome* of a trace (error? how slow?)
+  # before deciding whether to keep it. This is what lets us keep 100% of
+  # the traces that matter (errors, tail latency) while still affording to
+  # throw away most of the uninteresting baseline traffic at scale.
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 200000
+    expected_new_traces_per_sec: 50000
+    policies:
+      # Rule 1 — always keep traces containing an error span. These are the
+      # traces quality gates and A/B canary comparisons care about most.
+      - name: keep-all-errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+
+      # Rule 2 — always keep high-latency traces so p99/p999 investigations
+      # never lose the exact trace that caused the tail. Threshold is
+      # intentionally generous; StatisticalBaselineDeviationDetector in
+      # telemetry-query-api recomputes true baselines from what lands here.
+      - name: keep-high-latency
+        type: latency
+        latency:
+          threshold_ms: 750
+
+      # Rule 3 — everything else (healthy, fast requests) is sampled at a
+      # low fixed rate. This is the "baseline traffic at a lower rate"
+      # requirement: enough volume to compute accurate percentile/error-rate
+      # rollups without paying to store every single healthy span.
+      - name: baseline-probabilistic-sample
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 5
+
+      # Composite policy: a trace is kept if ANY sub-policy says keep,
+      # combining the above via "and" would be wrong here so we rely on
+      # tail_sampling's default OR-across-policies evaluation.
+
+exporters:
+  # Traces land on their own topic distinct from telemetry.raw.v1 metrics/logs
+  # so ClickHouse's Kafka-engine tables can consume each shape independently
+  # and so trace volume spikes don't backpressure metric ingestion.
+  kafka/traces:
+    brokers: ["telemetry-ingestion-redpanda:9092"]
+    topic: telemetry.raw.v1
+    encoding: otlp_proto
+    producer:
+      compression: zstd
+      max_message_bytes: 4194304
+      required_acks: 1
+    metadata:
+      full: false
+      retry:
+        max: 5
+        backoff: 500ms
+
+  kafka/metrics:
+    brokers: ["telemetry-ingestion-redpanda:9092"]
+    topic: telemetry.raw.v1
+    encoding: otlp_proto
+    producer:
+      compression: zstd
+      max_message_bytes: 4194304
+      required_acks: 1
+    metadata:
+      full: false
+      retry:
+        max: 5
+        backoff: 500ms
+
+  kafka/logs:
+    brokers: ["telemetry-ingestion-redpanda:9092"]
+    topic: telemetry.raw.v1
+    encoding: otlp_proto
+    producer:
+      compression: zstd
+      max_message_bytes: 4194304
+      required_acks: 1
+    metadata:
+      full: false
+      retry:
+        max: 5
+        backoff: 500ms
+
+  # Local troubleshooting only — never enabled in production overlays.
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling, batch]
+      exporters: [kafka/traces]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [kafka/metrics]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [kafka/logs]

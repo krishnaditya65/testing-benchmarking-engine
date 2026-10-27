@@ -1,0 +1,93 @@
+-- 005_hot_tier_ttl_and_cold_tier_storage_policy.sql
+--
+-- Retention tiering for `raw_telemetry_events` (001): today that table is single-tier — every
+-- row lives on the same local disk from ingestion until its 30-day DELETE TTL fires. That's
+-- correct for the first ~7 days (dashboards, quality gates, and incident investigation all read
+-- recent raw spans, and local NVMe/SSD is what keeps `getCrossServiceTraceCorrelation` and
+-- `IncidentRootCauseCorrelator`'s event-window queries fast), but it's the wrong tradeoff for
+-- days 8-30: that data is queried rarely (mostly ad-hoc post-incident forensics reaching back
+-- past a week) yet occupies the platform's most expensive, latency-optimized storage for its
+-- entire retained lifetime.
+--
+-- This migration introduces a second, cheaper storage tier and moves rows into it automatically
+-- with ClickHouse's built-in `TTL ... TO VOLUME` mechanism — no application code, no manual
+-- migration jobs, no separate "archival" table for callers to know about. `raw_telemetry_events`
+-- keeps exactly one schema and one set of query paths; only the underlying storage location of a
+-- given row changes as it ages.
+--
+-- ---------------------------------------------------------------------------------------------
+-- Prerequisite: server-side disk/storage-policy configuration
+-- ---------------------------------------------------------------------------------------------
+--
+-- Unlike table/column DDL, ClickHouse storage policies are NOT created by SQL — they're declared
+-- in server config XML, and SQL migrations only *reference* a policy name that must already
+-- exist on every node. That config XML is no longer just documented here — it's a real, loaded
+-- artifact:
+--
+--   - `server-config/storage-policy.xml` (production/staging): `hot_to_cold_tiered` policy,
+--     `default` disk for the hot volume, S3-backed `cold_tier_s3` disk for the cold volume.
+--     Wired into infrastructure/kubernetes/base/telemetry-clickhouse-statefulset.yaml via a
+--     ConfigMap mounted at /etc/clickhouse-server/config.d/, with the cold tier's actual PVC
+--     attached by infrastructure/kubernetes/overlays/production/clickhouse-cold-tier-volume-patch.yaml.
+--   - `server-config/storage-policy.local-dev.xml` (local dev): same policy/volume/disk names,
+--     but the cold disk is a second bind-mounted local directory instead of S3. Mounted by
+--     `docker-compose.yml`'s `telemetry-metrics-clickhouse` service.
+--
+-- The policy name (`hot_to_cold_tiered`) and volume names (`hot`/`cold`) referenced by the
+-- `ALTER TABLE` statements below MUST match those XML files exactly — treat the XML as
+-- authoritative if the two ever need to diverge (ClickHouse validates against the XML at
+-- startup, not against this SQL comment).
+--
+-- Local dev is therefore NO LONGER single-disk: both environments now have a real, working
+-- (if differently-backed — local disk vs. S3) two-tier storage policy, so this migration
+-- succeeds identically everywhere instead of being a documented production/staging-only step.
+-- See clickhouse-schema-migrations/README.md's "Retention tiering" section for the full picture.
+--
+-- ---------------------------------------------------------------------------------------------
+-- Cost/query-latency tradeoff this tiering encodes
+-- ---------------------------------------------------------------------------------------------
+--
+-- | Tier                    | Age window   | Storage cost | Query latency                        |
+-- |--------------------------|-------------|--------------|---------------------------------------|
+-- | Hot (`default` disk)     | 0-7 days     | Highest      | Lowest — local disk, no network hop   |
+-- | Cold (`cold_tier_s3`)    | 7-30 days    | ~5-10x cheaper (S3 vs. block storage) | Higher — S3 GET latency per part, no local page cache warmth |
+-- | Deleted                  | 30+ days     | None         | N/A — matches (001)'s existing DELETE TTL, unchanged |
+--
+-- The 7-day hot cutoff is chosen to match this platform's actual access pattern: the
+-- `telemetry-query-controller`/`root-cause-correlation.controller` read paths overwhelmingly
+-- target "this run" or "the last few hours/days" windows during an active pipeline run or a
+-- fresh incident; anything older is accessed rarely enough (ad-hoc historical comparison, a
+-- delayed postmortem) that S3's higher per-query latency is an acceptable trade for the storage
+-- cost savings across the remaining ~23 days of retention. The 30-day total retention and the
+-- DELETE TTL itself are unchanged from (001) — this migration only changes *where* a row lives
+-- during days 7-30, not how long it's kept.
+
+-- Step 1: attach `raw_telemetry_events` to the tiered storage policy. Existing parts are
+-- reshuffled onto the policy's first volume (hot) automatically by ClickHouse the next time a
+-- background merge touches them; no data is lost or blocked on this ALTER completing.
+ALTER TABLE telemetry_lake.raw_telemetry_events
+    MODIFY SETTING storage_policy = 'hot_to_cold_tiered';
+
+-- Step 2: replace the flat 30-day DELETE TTL from (001) with a two-stage TTL: move to the cold
+-- volume at 7 days, then delete at 30 days (unchanged final retention). `TTL` expressions in
+-- ClickHouse are evaluated in order and each clause fires independently once its interval
+-- elapses relative to the same base expression (`event_time`), so this reads as "at +7d, become
+-- eligible to move to the cold volume; at +30d (independently), become eligible for deletion" —
+-- not "move, then 30 days after the move, delete."
+ALTER TABLE telemetry_lake.raw_telemetry_events
+    MODIFY TTL
+        toDateTime(event_time) + INTERVAL 7 DAY TO VOLUME 'cold',
+        toDateTime(event_time) + INTERVAL 30 DAY DELETE;
+
+-- Notes for future maintainers:
+--
+-- - `latency_percentile_rollup` (003) and `error_rate_rollup` (004) are NOT tiered by this
+--   migration. They're already 1-2 orders of magnitude smaller than raw events (one row per
+--   service/dag_node/minute instead of one row per span), so the storage-cost case for moving
+--   them off hot storage is weak, and every dashboard/quality-gate query in
+--   `ClickHouseQueryRepository` reads them on the hot path where consistent low latency matters
+--   most. Revisit only if these tables' actual on-disk size becomes material.
+-- - `move_factor` in the policy config is a safety valve, not the primary tiering mechanism: it
+--   lets ClickHouse proactively spill hot-volume parts to cold under local disk-pressure even
+--   before their TTL would otherwise move them, so a hot volume nearing capacity degrades
+--   gracefully (older-than-strictly-necessary data moves early) instead of failing inserts.

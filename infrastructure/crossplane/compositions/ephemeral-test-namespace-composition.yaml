@@ -1,0 +1,238 @@
+# Ephemeral test namespace: the on-demand path environment-lifecycle-manager
+# (services/orchestration-control-plane/environment-lifecycle-manager) calls
+# once per pipeline run that requests an isolated environment (as opposed to
+# running against a shared/persistent target). It creates a Claim against
+# this XRD, waits for the Composition to become Ready, hands the namespace
+# name back to dag-workflow-scheduler for the DAG's test-data-seed and
+# load-test nodes to target, then deletes the Claim on teardown — which
+# cascades to every composed resource below.
+
+apiVersion: apiextensions.crossplane.io/v1
+kind: CompositeResourceDefinition
+metadata:
+  name: xephemeraltestnamespaces.testenvironments.testforge.io
+spec:
+  group: testenvironments.testforge.io
+  names:
+    kind: XEphemeralTestNamespace
+    plural: xephemeraltestnamespaces
+  claimNames:
+    kind: EphemeralTestNamespace
+    plural: ephemeraltestnamespaces
+  connectionSecretKeys:
+    - namespace
+    - resourceQuotaName
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                parameters:
+                  type: object
+                  properties:
+                    pipelineRunId:
+                      type: string
+                      description: >-
+                        The pipeline_run.id this namespace belongs to (see
+                        docs/api-specifications/pipeline-api-gateway.graphql
+                        PipelineRun type). Used to name the namespace and to
+                        label every composed resource for garbage-collection
+                        auditing.
+                    requestedByService:
+                      type: string
+                      default: environment-lifecycle-manager
+                    maxConcurrentVirtualUsers:
+                      type: integer
+                      description: >-
+                        Drives the namespace's ResourceQuota so a single
+                        runaway pipeline can't starve every other concurrent
+                        test namespace on the same cluster.
+                      default: 5000
+                    ttlMinutes:
+                      type: integer
+                      description: >-
+                        Hard upper bound on namespace lifetime. Belt-and-
+                        suspenders in case environment-lifecycle-manager's
+                        own teardown call fails to fire (e.g. the pipeline
+                        run crashed mid-execution).
+                      default: 120
+                  required:
+                    - pipelineRunId
+              required:
+                - parameters
+---
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: ephemeral-test-namespace-standard
+  labels:
+    testenvironments.testforge.io/tier: standard
+spec:
+  compositeTypeRef:
+    apiVersion: testenvironments.testforge.io/v1alpha1
+    kind: XEphemeralTestNamespace
+  writeConnectionSecretsToNamespace: crossplane-system
+  resources:
+    - name: namespace
+      base:
+        apiVersion: kubernetes.crossplane.io/v1alpha2
+        kind: Object
+        spec:
+          forProvider:
+            manifest:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                labels:
+                  testforge.io/ephemeral: "true"
+                  testforge.io/managed-by: environment-lifecycle-manager
+          providerConfigRef:
+            name: testforge-in-cluster
+      patches:
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.parameters.pipelineRunId
+          toFieldPath: spec.forProvider.manifest.metadata.name
+          transforms:
+            - type: string
+              string:
+                fmt: "testforge-run-%s"
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.parameters.pipelineRunId
+          toFieldPath: spec.forProvider.manifest.metadata.labels[testforge.io/pipeline-run-id]
+        - type: ToCompositeFieldPath
+          fromFieldPath: spec.forProvider.manifest.metadata.name
+          toFieldPath: status.namespace
+
+    - name: resource-quota
+      base:
+        apiVersion: kubernetes.crossplane.io/v1alpha2
+        kind: Object
+        spec:
+          forProvider:
+            manifest:
+              apiVersion: v1
+              kind: ResourceQuota
+              metadata:
+                name: pipeline-run-quota
+              spec:
+                hard:
+                  requests.cpu: "200"
+                  requests.memory: 400Gi
+                  limits.cpu: "400"
+                  limits.memory: 800Gi
+                  pods: "600"
+          providerConfigRef:
+            name: testforge-in-cluster
+      patches:
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.parameters.pipelineRunId
+          toFieldPath: spec.forProvider.manifest.metadata.namespace
+          transforms:
+            - type: string
+              string:
+                fmt: "testforge-run-%s"
+        # maxConcurrentVirtualUsers scales pod/cpu ceilings roughly linearly
+        # so a 50k-VU load test node gets proportionally more quota than a
+        # smoke-test-only pipeline.
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.parameters.maxConcurrentVirtualUsers
+          toFieldPath: spec.forProvider.manifest.spec.hard[pods]
+          transforms:
+            - type: math
+              math:
+                multiply: 0.012
+
+    - name: default-deny-network-policy
+      base:
+        apiVersion: kubernetes.crossplane.io/v1alpha2
+        kind: Object
+        spec:
+          forProvider:
+            manifest:
+              apiVersion: networking.k8s.io/v1
+              kind: NetworkPolicy
+              metadata:
+                name: default-deny-ingress
+              spec:
+                podSelector: {}
+                policyTypes: ["Ingress"]
+          providerConfigRef:
+            name: testforge-in-cluster
+      patches:
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.parameters.pipelineRunId
+          toFieldPath: spec.forProvider.manifest.metadata.namespace
+          transforms:
+            - type: string
+              string:
+                fmt: "testforge-run-%s"
+
+    - name: allow-execution-fleet-egress-network-policy
+      base:
+        apiVersion: kubernetes.crossplane.io/v1alpha2
+        kind: Object
+        spec:
+          forProvider:
+            manifest:
+              apiVersion: networking.k8s.io/v1
+              kind: NetworkPolicy
+              metadata:
+                name: allow-execution-fleet-ingress
+              spec:
+                podSelector: {}
+                policyTypes: ["Ingress"]
+                ingress:
+                  - from:
+                      - namespaceSelector:
+                          matchLabels:
+                            app.kubernetes.io/part-of: distributed-testing-benchmarking-tool
+                        podSelector:
+                          matchLabels:
+                            app.kubernetes.io/component: execution-fleet
+          providerConfigRef:
+            name: testforge-in-cluster
+      patches:
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.parameters.pipelineRunId
+          toFieldPath: spec.forProvider.manifest.metadata.namespace
+          transforms:
+            - type: string
+              string:
+                fmt: "testforge-run-%s"
+
+    - name: ttl-expiry-annotation
+      base:
+        apiVersion: kubernetes.crossplane.io/v1alpha2
+        kind: Object
+        spec:
+          forProvider:
+            manifest:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: namespace-ttl
+              data:
+                ttlMinutes: "120"
+          providerConfigRef:
+            name: testforge-in-cluster
+      patches:
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.parameters.pipelineRunId
+          toFieldPath: spec.forProvider.manifest.metadata.namespace
+          transforms:
+            - type: string
+              string:
+                fmt: "testforge-run-%s"
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.parameters.ttlMinutes
+          toFieldPath: spec.forProvider.manifest.data.ttlMinutes
+          transforms:
+            - type: string
+              string:
+                fmt: "%d"

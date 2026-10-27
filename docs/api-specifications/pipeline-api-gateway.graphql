@@ -1,0 +1,246 @@
+"""
+pipeline-api-gateway GraphQL SDL excerpt.
+
+Served by services/orchestration-control-plane/pipeline-api-gateway. This is
+the schema workflow-canvas-frontend queries/mutates against for CRUD + live
+run status, and the domain model testforge-cli's `internal/pipelineconfig`
+package mirrors in Go for local DAG validation. Only the types most relevant
+to pipeline definition, execution, and quality gates are included below —
+the full schema also covers RBAC, org/team membership, and environment
+lifecycle types.
+"""
+
+scalar DateTime
+scalar JSON
+
+# ---------------------------------------------------------------------------
+# Pipeline Definition
+# ---------------------------------------------------------------------------
+
+"""
+A DAG node type. Must stay in lockstep with
+shared-libraries/dag-domain-model's NodeType union and
+tools/testforge-cli/internal/pipelineconfig's NodeType constants.
+"""
+enum DAGNodeType {
+  ENVIRONMENT_PROVISION
+  API_SMOKE_TEST
+  DATABASE_SEED
+  LOAD_TEST
+  CHAOS_INJECTION
+  DATABASE_CONSISTENCY_ASSERTION
+  ENVIRONMENT_TEARDOWN
+}
+
+enum QualityGateSeverity {
+  BLOCKING
+  WARNING
+}
+
+type DAGNode {
+  id: ID!
+  type: DAGNodeType!
+  dependsOn: [ID!]!
+  """
+  Node-type-specific configuration (e.g. virtualUsers ramp shape for a
+  LOAD_TEST node, recordCount for a DATABASE_SEED node). Typed as JSON at
+  the GraphQL layer; shared-libraries/dag-domain-model narrows this per
+  node type on the TypeScript side.
+  """
+  config: JSON!
+}
+
+type QualityGateDefinition {
+  name: String!
+  metric: String!
+  threshold: String!
+  severity: QualityGateSeverity!
+}
+
+type PipelineDefinition {
+  id: ID!
+  name: String!
+  description: String
+  owner: String
+  labels: JSON
+  nodes: [DAGNode!]!
+  qualityGates: [QualityGateDefinition!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  """
+  Most recent runs of this definition, newest first. Paginated separately
+  via Query.pipelineRuns for full history.
+  """
+  recentRuns(limit: Int = 10): [PipelineRun!]!
+}
+
+input DAGNodeInput {
+  id: ID!
+  type: DAGNodeType!
+  dependsOn: [ID!] = []
+  config: JSON!
+}
+
+input QualityGateInput {
+  name: String!
+  metric: String!
+  threshold: String!
+  severity: QualityGateSeverity!
+}
+
+input UpsertPipelineDefinitionInput {
+  name: String!
+  description: String
+  owner: String
+  labels: JSON
+  nodes: [DAGNodeInput!]!
+  qualityGates: [QualityGateInput!] = []
+}
+
+# ---------------------------------------------------------------------------
+# Pipeline Run
+# ---------------------------------------------------------------------------
+
+enum PipelineRunStatus {
+  PENDING
+  PROVISIONING_ENVIRONMENT
+  RUNNING
+  SUCCEEDED
+  FAILED
+  ERRORED
+  CANCELLED
+}
+
+enum DAGNodeRunStatus {
+  PENDING
+  DISPATCHED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  SKIPPED
+}
+
+type DAGNodeRun {
+  nodeId: ID!
+  type: DAGNodeType!
+  status: DAGNodeRunStatus!
+  startedAt: DateTime
+  finishedAt: DateTime
+  """
+  Worker pool that executed this node, e.g. "protocol-load-worker-go" for a
+  LOAD_TEST node — empty for control-plane-only nodes like
+  ENVIRONMENT_PROVISION.
+  """
+  workerPool: String
+  errorMessage: String
+}
+
+type QualityGateResult {
+  name: String!
+  passed: Boolean!
+  severity: QualityGateSeverity!
+  metric: String!
+  observedValue: String!
+  threshold: String!
+}
+
+type PipelineRun implements Node {
+  id: ID!
+  pipelineDefinition: PipelineDefinition!
+  environment: String!
+  status: PipelineRunStatus!
+  """
+  Ephemeral namespace this run executed in, provisioned via
+  environment-lifecycle-manager / infrastructure/crossplane. Null until the
+  ENVIRONMENT_PROVISION node completes.
+  """
+  ephemeralNamespace: String
+  triggeredBy: String!
+  """
+  "cli" for tools/testforge-cli submissions, "ui" for
+  workflow-canvas-frontend, "api" for direct API callers.
+  """
+  triggerSource: String!
+  nodeRuns: [DAGNodeRun!]!
+  qualityGateResults: [QualityGateResult!]!
+  startedAt: DateTime!
+  finishedAt: DateTime
+}
+
+interface Node {
+  id: ID!
+}
+
+type PipelineRunConnection {
+  edges: [PipelineRunEdge!]!
+  pageInfo: PageInfo!
+}
+
+type PipelineRunEdge {
+  cursor: String!
+  node: PipelineRun!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  endCursor: String
+}
+
+# ---------------------------------------------------------------------------
+# Query / Mutation / Subscription
+# ---------------------------------------------------------------------------
+
+type Query {
+  pipelineDefinition(id: ID!): PipelineDefinition
+  pipelineDefinitionByName(name: String!): PipelineDefinition
+  pipelineDefinitions(labelSelector: JSON): [PipelineDefinition!]!
+
+  pipelineRun(id: ID!): PipelineRun
+  """
+  Paginated run history for a definition, optionally filtered by status —
+  backs both workflow-canvas-frontend's run history view and
+  `testforge run`'s post-submission poll.
+  """
+  pipelineRuns(
+    pipelineDefinitionId: ID!
+    status: PipelineRunStatus
+    first: Int = 20
+    after: String
+  ): PipelineRunConnection!
+}
+
+type Mutation {
+  upsertPipelineDefinition(input: UpsertPipelineDefinitionInput!): PipelineDefinition!
+  deletePipelineDefinition(id: ID!): Boolean!
+
+  """
+  Submits a pipeline definition (by reference or inline) for execution in
+  the given environment. This is the GraphQL-side equivalent of the REST
+  endpoint in openapi/testforge-cli-submission-endpoint.yaml — testforge-cli
+  uses REST for simplicity in CI, workflow-canvas-frontend uses this
+  mutation directly.
+  """
+  submitPipelineRun(
+    pipelineDefinitionId: ID!
+    environment: String!
+  ): PipelineRun!
+
+  cancelPipelineRun(id: ID!): PipelineRun!
+}
+
+type Subscription {
+  """
+  Live status updates for a single run — node transitions, quality gate
+  results as they're evaluated, terminal status. Backs
+  workflow-canvas-frontend's live DAG canvas view during a run.
+  """
+  pipelineRunUpdated(id: ID!): PipelineRun!
+
+  """
+  Live active-virtual-users gauge for a running LOAD_TEST node, sourced from
+  telemetry-query-api aggregates. Used by the DAG canvas's live throughput
+  chart, distinct from the same metric the execution-fleet HPA polls
+  independently via the metrics adapter.
+  """
+  activeVirtualUsers(pipelineRunId: ID!, nodeId: ID!): Int!
+}

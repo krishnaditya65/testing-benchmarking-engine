@@ -1,0 +1,171 @@
+# Orchestration Control Plane deployments: low-QPS, stateful-adjacent
+# services that plan/schedule/observe but never generate load themselves
+# (see ARCHITECTURE.md "Independent scaling"). Bundled in one file because
+# they scale together and rarely need per-service kustomize patches beyond
+# what the staging/production overlays already provide.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipeline-api-gateway
+  namespace: testforge-platform
+  labels:
+    app.kubernetes.io/name: pipeline-api-gateway
+    app.kubernetes.io/component: orchestration-control-plane
+    app.kubernetes.io/part-of: distributed-testing-benchmarking-tool
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pipeline-api-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pipeline-api-gateway
+        app.kubernetes.io/component: orchestration-control-plane
+    spec:
+      serviceAccountName: pipeline-api-gateway
+      containers:
+        - name: pipeline-api-gateway
+          image: ghcr.io/testforge/pipeline-api-gateway:0.1.0
+          ports:
+            - name: http-graphql
+              containerPort: 4000
+            - name: ws-subscriptions
+              containerPort: 4001
+          env:
+            - name: TESTFORGE_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: pipeline-api-gateway-db
+                  key: connection-string
+            - name: TESTFORGE_TEMPORAL_ADDRESS
+              value: dag-workflow-scheduler-temporal-frontend.testforge-platform.svc.cluster.local:7233
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: http-graphql
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: http-graphql
+            initialDelaySeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pipeline-api-gateway
+  namespace: testforge-platform
+  labels:
+    app.kubernetes.io/name: pipeline-api-gateway
+spec:
+  selector:
+    app.kubernetes.io/name: pipeline-api-gateway
+  ports:
+    - name: http-graphql
+      port: 80
+      targetPort: http-graphql
+    - name: ws-subscriptions
+      port: 4001
+      targetPort: ws-subscriptions
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dag-workflow-scheduler
+  namespace: testforge-platform
+  labels:
+    app.kubernetes.io/name: dag-workflow-scheduler
+    app.kubernetes.io/component: orchestration-control-plane
+    app.kubernetes.io/part-of: distributed-testing-benchmarking-tool
+spec:
+  # Deliberately low replica count relative to protocol-load-worker-go: this
+  # process only orchestrates DAG state via Temporal workflows, it does not
+  # do the throughput-bound work itself.
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dag-workflow-scheduler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dag-workflow-scheduler
+        app.kubernetes.io/component: orchestration-control-plane
+    spec:
+      serviceAccountName: dag-workflow-scheduler
+      containers:
+        - name: dag-workflow-scheduler
+          image: ghcr.io/testforge/dag-workflow-scheduler:0.1.0
+          ports:
+            - name: grpc-internal
+              containerPort: 7070
+          env:
+            - name: TESTFORGE_TEMPORAL_ADDRESS
+              value: temporal-frontend.testforge-platform.svc.cluster.local:7233
+            - name: TESTFORGE_DISPATCH_TOPIC
+              value: dag.node.dispatch.v1
+            - name: TESTFORGE_REDPANDA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: telemetry-lake-connection
+                  key: redpanda-brokers
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: environment-lifecycle-manager
+  namespace: testforge-platform
+  labels:
+    app.kubernetes.io/name: environment-lifecycle-manager
+    app.kubernetes.io/component: orchestration-control-plane
+    app.kubernetes.io/part-of: distributed-testing-benchmarking-tool
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: environment-lifecycle-manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: environment-lifecycle-manager
+        app.kubernetes.io/component: orchestration-control-plane
+    spec:
+      # Needs RBAC to create/delete XR/Claim objects handled by the
+      # Crossplane composition in infrastructure/crossplane/compositions/,
+      # so it is granted a scoped ClusterRole rather than cluster-admin.
+      serviceAccountName: environment-lifecycle-manager
+      containers:
+        - name: environment-lifecycle-manager
+          image: ghcr.io/testforge/environment-lifecycle-manager:0.1.0
+          ports:
+            - name: grpc-internal
+              containerPort: 7071
+          env:
+            - name: TESTFORGE_CROSSPLANE_XRD_GROUP
+              value: testenvironments.testforge.io
+            - name: TESTFORGE_TERRAFORM_STATE_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: environment-lifecycle-manager-config
+                  key: terraform-state-bucket
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

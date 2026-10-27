@@ -1,0 +1,53 @@
+// telemetry_event.proto
+//
+// Wire contract for the `telemetry.raw.v1` Redpanda topic — see ARCHITECTURE.md
+// "Communication contracts": workers/services -> telemetry lake. In practice the OTel
+// Collector's kafka exporters publish native `otlp_proto` payloads (OpenTelemetry's own
+// proto definitions) to this topic; TelemetryRawEvent below is the platform-level envelope
+// wrapping those payloads that ClickHouse's Kafka-engine ingestion table
+// (clickhouse-schema-migrations/002) actually projects into columns. Any producer that is not
+// the OTel Collector itself (e.g. a worker emitting a synthetic telemetry event directly for
+// testing) MUST publish this envelope shape.
+//
+// Mirrors TelemetryRawEvent in
+// shared-libraries/redpanda-ingestion-pipeline/src/topic-definitions.ts field-for-field.
+
+syntax = "proto3";
+
+package testforge.protocol.telemetry_event.v1;
+
+option go_package = "github.com/testforge/protocol-contracts/telemetry_event;telemetryeventpb";
+
+enum TelemetrySignalKind {
+  TELEMETRY_SIGNAL_KIND_UNSPECIFIED = 0;
+  TELEMETRY_SIGNAL_KIND_TRACE = 1;
+  TELEMETRY_SIGNAL_KIND_METRIC = 2;
+  TELEMETRY_SIGNAL_KIND_LOG = 3;
+}
+
+enum SpanStatusCode {
+  SPAN_STATUS_CODE_UNSET = 0;
+  SPAN_STATUS_CODE_OK = 1;
+  SPAN_STATUS_CODE_ERROR = 2;
+}
+
+message TelemetryRawEvent {
+  string event_id = 1;
+  TelemetrySignalKind signal_kind = 2;
+  string service_name = 3;
+
+  string trace_id = 4;   // hex-encoded; empty for some log records
+  string span_id = 5;    // hex-encoded; empty for some log records
+
+  string pipeline_run_id = 6;
+  string dag_node_id = 7;
+
+  int64 timestamp_unix_nano = 8;
+  optional double duration_ms = 9;
+  SpanStatusCode status_code = 10;
+
+  map<string, string> attributes = 11;
+
+  // Raw OTLP protobuf payload for full-fidelity replay/debug, opaque to this envelope.
+  bytes otlp_payload = 12;
+}

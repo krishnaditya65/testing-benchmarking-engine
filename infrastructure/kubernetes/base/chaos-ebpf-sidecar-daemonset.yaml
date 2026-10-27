@@ -1,0 +1,98 @@
+# Execution Fleet worker: services/execution-fleet/chaos-ebpf-sidecar
+#
+# Runs as a DaemonSet (one instance per node, not per pod) because eBPF
+# programs attach at the kernel/network-namespace level of the node itself,
+# not inside a single container's cgroup. dag-workflow-scheduler dispatches
+# chaos-injection DAG nodes (latency, packet-loss, syscall-fault-injection)
+# over dag.node.dispatch.v1; this agent is the thing that actually attaches
+# the tc/XDP programs the node needs to realize that fault.
+#
+# hostNetwork consideration: hostNetwork is intentionally left OFF by
+# default. Network-namespace-scoped faults (latency, packet loss) are
+# injected by attaching into the *target* pod's network namespace via
+# /proc/<pid>/ns/net, which only requires CAP_SYS_ADMIN + CAP_NET_ADMIN and
+# the hostPID below — it does not require this DaemonSet's own pod to share
+# the host network namespace. Only flip hostNetwork: true if a future
+# fault type needs to observe/mutate traffic on the host's physical NIC
+# before it reaches any pod netns (e.g. node-level bandwidth throttling);
+# doing so widens the blast radius of a compromised sidecar to every pod on
+# the node, so it must be a deliberate, reviewed change, not a default.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: chaos-ebpf-sidecar
+  namespace: testforge-platform
+  labels:
+    app.kubernetes.io/name: chaos-ebpf-sidecar
+    app.kubernetes.io/component: execution-fleet
+    app.kubernetes.io/part-of: distributed-testing-benchmarking-tool
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chaos-ebpf-sidecar
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chaos-ebpf-sidecar
+        app.kubernetes.io/component: execution-fleet
+    spec:
+      serviceAccountName: chaos-ebpf-sidecar
+      hostPID: true
+      hostNetwork: false
+      # Only scheduled onto nodes explicitly labeled to accept fault
+      # injection, so a control-plane or telemetry-lake node never runs a
+      # privileged eBPF agent by accident.
+      nodeSelector:
+        testforge.io/execution-fleet: "true"
+      tolerations:
+        - key: testforge.io/execution-fleet
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: chaos-ebpf-sidecar
+          image: ghcr.io/testforge/chaos-ebpf-sidecar:0.1.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+                - NET_ADMIN
+                - BPF
+                - PERFMON
+          volumeMounts:
+            - name: bpf-fs
+              mountPath: /sys/fs/bpf
+            - name: cgroup-fs
+              mountPath: /sys/fs/cgroup
+            - name: debug-fs
+              mountPath: /sys/kernel/debug
+          env:
+            - name: TESTFORGE_DISPATCH_TOPIC
+              value: dag.node.dispatch.v1
+            - name: TESTFORGE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: bpf-fs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+        - name: cgroup-fs
+          hostPath:
+            path: /sys/fs/cgroup
+        - name: debug-fs
+          hostPath:
+            path: /sys/kernel/debug

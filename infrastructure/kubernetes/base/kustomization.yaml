@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: testforge-platform
+
+resources:
+  - namespace.yaml
+  - execution-fleet-worker-deployment.yaml
+  - chaos-ebpf-sidecar-daemonset.yaml
+  - control-plane-services-deployment.yaml
+  - telemetry-clickhouse-statefulset.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: distributed-testing-benchmarking-tool

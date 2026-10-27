@@ -1,0 +1,48 @@
+[package]
+name = "protocol-load-worker-rust"
+version = "0.1.0"
+edition = "2021"
+description = "tokio-based max-throughput TCP/QUIC socket saturation worker for the execution fleet"
+publish = false
+
+[[bin]]
+name = "protocol-load-worker-rust"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime. "full" pulls in net, rt-multi-thread, macros, signal, sync, time -
+# everything this worker needs for connection-pool fan-out and graceful shutdown.
+tokio = { version = "1", features = ["full"] }
+
+# QUIC transport. Modeled here at the API-surface level (Endpoint / Connection /
+# SendStream / RecvStream) - see src/protocol/quic_http3_client.rs for NOTES on what
+# real TLS/ALPN wiring requires.
+quinn = "0.11"
+
+# TLS backend used by quinn for QUIC's mandatory TLS 1.3 handshake, and referenced by
+# the eBPF/userspace latency probe for handshake timing hooks.
+rustls = "0.23"
+
+# Config / telemetry payload (de)serialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Structured logging + spans, exported onward as OTLP per ARCHITECTURE.md.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling: anyhow at the binary boundary (main.rs), thiserror for typed
+# library errors surfaced by traits/structs below.
+anyhow = "1"
+thiserror = "1"
+
+# CLI + env-var driven configuration for this stateless worker.
+clap = { version = "4", features = ["derive", "env"] }
+
+# Enables `async fn` in the `EbpfLatencyProbe` trait (dyn-compatible async traits are
+# not yet native in stable Rust for our MSRV target).
+async-trait = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1

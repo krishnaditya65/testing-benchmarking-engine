@@ -1,0 +1,33 @@
+# Note on telemetry-metrics-clickhouse: staging intentionally does NOT add a
+# clickhouse-cold-tier-volume-patch.yaml-style patch (unlike overlays/production/). It runs
+# base's single hot-tier PVC + S3-backed cold tier as-is — a second on-cluster cold-tier PVC is
+# a production-scale-only concern, matching how staging already stays smaller/simpler than
+# production elsewhere (see worker-hpa-ceiling-patch.yaml).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: testforge-platform-staging
+
+resources:
+  - ../../base
+
+nameSuffix: ""
+
+patches:
+  - path: replica-count-patch.yaml
+  - path: worker-hpa-ceiling-patch.yaml
+
+images:
+  - name: ghcr.io/testforge/protocol-load-worker-go
+    newTag: staging
+  - name: ghcr.io/testforge/chaos-ebpf-sidecar
+    newTag: staging
+  - name: ghcr.io/testforge/pipeline-api-gateway
+    newTag: staging
+  - name: ghcr.io/testforge/dag-workflow-scheduler
+    newTag: staging
+  - name: ghcr.io/testforge/environment-lifecycle-manager
+    newTag: staging
+
+commonLabels:
+  testforge.io/environment: staging

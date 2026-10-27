@@ -1,0 +1,58 @@
+# Example workflow showing how a consuming repository (or this monorepo's
+# own CI) wires testforge-cli into a GitOps pipeline gate. Copy/adapt into
+# .github/workflows/ — this file under tools/testforge-cli/.github/ is a
+# reference snippet, not itself an active workflow for this repo.
+name: checkout-load-test
+
+on:
+  pull_request:
+    paths:
+      - "pipelines/checkout-load-test.yaml"
+      - "services/checkout-api/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+
+jobs:
+  lint-pipeline-definition:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install testforge-cli
+        run: go install github.com/testforge/distributed-testing-benchmarking-tool/tools/testforge-cli@latest
+
+      # Fails fast on an unknown node type, duplicate id, dangling
+      # dependsOn, or DAG cycle — before ever contacting pipeline-api-gateway.
+      - name: Validate pipeline DAG
+        run: testforge validate ./pipelines/checkout-load-test.yaml
+
+  run-checkout-load-test:
+    needs: lint-pipeline-definition
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install testforge-cli
+        run: go install github.com/testforge/distributed-testing-benchmarking-tool/tools/testforge-cli@latest
+
+      # `testforge run` blocks until the pipeline reaches a terminal status
+      # and exits non-zero on a blocking quality-gate failure (exit code
+      # 10), a warning-only failure (11), or a run-level error (20) — see
+      # internal/cicdintegration/quality_gate_exit_code_mapper.go. That
+      # non-zero exit is what fails this GitHub Actions job and therefore
+      # blocks the PR via branch protection.
+      - name: Run checkout-load-test pipeline
+        env:
+          TESTFORGE_API_TOKEN: ${{ secrets.TESTFORGE_API_TOKEN }}
+        run: |
+          testforge run \
+            --pipeline ./pipelines/checkout-load-test.yaml \
+            --environment ${{ github.event.inputs.environment || 'staging' }} \
+            --wait-timeout 30m \
+            --api-gateway-url https://pipeline-api-gateway.testforge.internal

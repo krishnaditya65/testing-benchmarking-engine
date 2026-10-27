@@ -1,0 +1,18 @@
+apiVersion: v2
+name: pipeline-api-gateway
+description: >-
+  NestJS BFF/GraphQL gateway for services/orchestration-control-plane/pipeline-api-gateway.
+  Serves GraphQL CRUD + queries and WebSocket subscriptions to
+  workflow-canvas-frontend, handles auth/RBAC, and is the REST submission
+  target for tools/testforge-cli.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - orchestration-control-plane
+  - graphql
+  - bff
+home: https://github.com/testforge/distributed-testing-benchmarking-tool
+maintainers:
+  - name: Platform Engineering
+    email: platform-eng@testforge.io

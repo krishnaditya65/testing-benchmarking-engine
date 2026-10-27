@@ -1,0 +1,270 @@
+openapi: 3.0.3
+info:
+  title: pipeline-api-gateway — testforge-cli submission endpoint
+  description: >-
+    REST excerpt of pipeline-api-gateway's API, covering only the endpoints
+    tools/testforge-cli's `testforge run` command uses to submit a pipeline
+    run and poll it to completion. The full CRUD surface for
+    PipelineDefinition management is served over GraphQL — see
+    docs/api-specifications/pipeline-api-gateway.graphql — this REST path
+    exists specifically because CI runners want a stable, dependency-light
+    HTTP contract without a GraphQL client.
+  version: "1.0"
+servers:
+  - url: https://pipeline-api-gateway.testforge.internal/v1
+    description: In-cluster / VPN-only production endpoint
+  - url: https://pipeline-api-gateway.staging.testforge.internal/v1
+    description: Staging endpoint
+
+paths:
+  /pipeline-runs:
+    post:
+      operationId: submitPipelineRun
+      summary: Submit a pipeline definition for execution
+      description: >-
+        Submitted by `testforge run` after local DAG validation
+        (tools/testforge-cli/internal/pipelineconfig) succeeds. Accepts
+        either a fully inline pipeline definition (the common case for CLI
+        usage, matching examples/pipelines/checkout-load-test.yaml) or a
+        reference to a previously-registered PipelineDefinition id.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PipelineRunSubmission"
+      responses:
+        "202":
+          description: >-
+            Accepted. The run has been enqueued with dag-workflow-scheduler
+            but has not necessarily started — poll GET /pipeline-runs/{id}
+            for status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PipelineRun"
+        "400":
+          description: >-
+            Pipeline definition failed schema or DAG validation server-side
+            (e.g. unknown node type, cycle) — should be rare since
+            testforge-cli validates locally first, but the server is the
+            final authority.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: >-
+            Well-formed but semantically invalid, e.g. `environment` does not
+            exist or the caller lacks RBAC permission to run against it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /pipeline-runs/{runId}:
+    get:
+      operationId: getPipelineRun
+      summary: Fetch a pipeline run's current status and quality-gate results
+      description: >-
+        Polled by `testforge run`'s wait loop (see
+        tools/testforge-cli/cmd/run.go) every 5 seconds until `status`
+        reaches a terminal value (SUCCEEDED, FAILED, ERRORED, CANCELLED) or
+        the CLI's --wait-timeout is reached. Once terminal, `qualityGates`
+        is fully populated and drives the CLI's exit code via
+        internal/cicdintegration/quality_gate_exit_code_mapper.go.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PipelineRun"
+        "404":
+          description: No pipeline run with that id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        Token issued to a service account or CI credential; passed as
+        TESTFORGE_API_TOKEN / --api-token by testforge-cli.
+
+  schemas:
+    DAGNode:
+      type: object
+      required: [id, type]
+      properties:
+        id:
+          type: string
+          example: load-test-checkout-flow
+        type:
+          type: string
+          enum:
+            - environment-provision
+            - api-smoke-test
+            - database-seed
+            - load-test
+            - chaos-injection
+            - database-consistency-assertion
+            - environment-teardown
+        dependsOn:
+          type: array
+          items:
+            type: string
+          default: []
+        config:
+          type: object
+          additionalProperties: true
+          description: Node-type-specific configuration payload.
+
+    QualityGate:
+      type: object
+      required: [name, metric, threshold, severity]
+      properties:
+        name:
+          type: string
+          example: checkout-p99-latency-under-load
+        metric:
+          type: string
+          example: http.server.duration.p99
+        threshold:
+          type: string
+          example: "750ms"
+        severity:
+          type: string
+          enum: [blocking, warning]
+
+    QualityGateResult:
+      allOf:
+        - $ref: "#/components/schemas/QualityGate"
+        - type: object
+          required: [passed, observedValue]
+          properties:
+            passed:
+              type: boolean
+            observedValue:
+              type: string
+              example: "612ms"
+
+    PipelineRunSubmission:
+      type: object
+      required: [pipelineName, environment, definition]
+      properties:
+        pipelineName:
+          type: string
+          example: checkout-load-test
+        environment:
+          type: string
+          example: staging
+        definition:
+          type: object
+          description: >-
+            Full parsed PipelineDefinition document (apiVersion, kind,
+            metadata, spec.nodes, spec.qualityGates) as produced by
+            tools/testforge-cli/internal/pipelineconfig.Parse.
+          required: [apiVersion, kind, metadata, spec]
+          properties:
+            apiVersion:
+              type: string
+              example: testforge.io/v1
+            kind:
+              type: string
+              enum: [PipelineDefinition]
+            metadata:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                owner:
+                  type: string
+                labels:
+                  type: object
+                  additionalProperties:
+                    type: string
+            spec:
+              type: object
+              required: [nodes]
+              properties:
+                nodes:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/DAGNode"
+                qualityGates:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/QualityGate"
+
+    PipelineRun:
+      type: object
+      properties:
+        runId:
+          type: string
+          example: run-8f21c3
+        status:
+          type: string
+          enum:
+            - PENDING
+            - PROVISIONING_ENVIRONMENT
+            - RUNNING
+            - SUCCEEDED
+            - FAILED
+            - ERRORED
+            - CANCELLED
+        runErrored:
+          type: boolean
+          description: >-
+            True if the run itself failed to execute to completion (e.g.
+            environment provisioning failed), as distinct from completing
+            but failing a quality gate. Drives
+            cicdintegration.ExitPipelineRunErrored.
+        ephemeralNamespace:
+          type: string
+          nullable: true
+        qualityGates:
+          type: array
+          items:
+            $ref: "#/components/schemas/QualityGateResult"
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    ErrorResponse:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          example: validation_failed
+        message:
+          type: string
+          example: "node 'load-test-checkout-flow': dependsOn references undefined node 'seed-order-history'"

@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pipeline-api-gateway.fullname" . }}
+  labels:
+    {{- include "pipeline-api-gateway.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "pipeline-api-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pipeline-api-gateway.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "pipeline-api-gateway.serviceAccountName" . }}
+      containers:
+        - name: pipeline-api-gateway
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http-graphql
+              containerPort: {{ .Values.ports.graphql }}
+            - name: ws-subscriptions
+              containerPort: {{ .Values.ports.subscriptions }}
+          env:
+            - name: TESTFORGE_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.env.postgresSecretName }}
+                  key: {{ .Values.env.postgresSecretKey }}
+            - name: TESTFORGE_TEMPORAL_ADDRESS
+              value: {{ .Values.env.temporalAddress | quote }}
+            - name: OPA_SIDECAR_BASE_URL
+              value: {{ .Values.env.opaSidecarBaseUrl | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http-graphql
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http-graphql
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+        {{- if .Values.opaSidecar.enabled }}
+        - name: opa-sidecar
+          image: "{{ .Values.opaSidecar.image.repository }}:{{ .Values.opaSidecar.image.tag }}"
+          imagePullPolicy: {{ .Values.opaSidecar.image.pullPolicy }}
+          # Matches opa-rego-policy-evaluator.adapter.ts's OPA_SIDECAR_BASE_URL
+          # default (http://localhost:8181) and its Data API query path
+          # (/v1/data/testforge/policies/violations) against the `package
+          # testforge.policies` bundle mounted from opa-policy-bundle-configmap.yaml.
+          args:
+            - "run"
+            - "--server"
+            - "--addr=:{{ .Values.opaSidecar.port }}"
+            - "-b"
+            - "/policies"
+          ports:
+            - name: opa-http
+              containerPort: {{ .Values.opaSidecar.port }}
+          volumeMounts:
+            - name: opa-policy-bundle
+              mountPath: /policies
+              readOnly: true
+          resources:
+            {{- toYaml .Values.opaSidecar.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: opa-http
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: opa-http
+            initialDelaySeconds: 5
+        {{- end }}
+      {{- if .Values.opaSidecar.enabled }}
+      volumes:
+        - name: opa-policy-bundle
+          configMap:
+            name: {{ include "pipeline-api-gateway.fullname" . }}-opa-policy-bundle
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,21 @@
+{
+  "name": "@ai-assisted-qa/log-to-test-generator-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Log-to-Test Generation: mines production APM/session telemetry for the most frequent traffic paths and recent crash sequences, and converts them into candidate DAG PipelineDefinitions.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@shared-libraries/dag-domain-model": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5",
+    "@types/node": "^20.14.10"
+  }
+}

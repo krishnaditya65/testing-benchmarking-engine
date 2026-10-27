@@ -1,0 +1,33 @@
+# Adds a second, distinct-from-hot PersistentVolumeClaim to telemetry-metrics-clickhouse for
+# production clusters/cloud accounts that pin the storage_policy's cold volume to on-cluster
+# block storage instead of base's default S3-backed `cold_tier_s3` disk (e.g. a cloud account
+# without S3/object-storage access provisioned yet, or a compliance requirement that cold data
+# stay on-cluster). This is a JSON6902 patch (not strategic-merge) because
+# StatefulSet.spec.volumeClaimTemplates has no merge key, so a strategic-merge patch would
+# replace the whole list instead of appending to it.
+#
+# Staging intentionally does NOT apply this patch (see overlays/staging/kustomization.yaml) —
+# staging's ClickHouse stays on base's single hot-tier PVC + S3 cold tier, matching how staging
+# already runs a smaller/simpler footprint than production elsewhere in this repo (e.g.
+# worker-hpa-ceiling-patch.yaml capping the worker fleet well below production's ceiling).
+- op: add
+  path: /spec/volumeClaimTemplates/-
+  value:
+    metadata:
+      name: clickhouse-cold-tier-data
+      labels:
+        app.kubernetes.io/name: telemetry-metrics-clickhouse
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      # Cold tier holds days 7-30 of raw_telemetry_events (see migration 005) — much larger
+      # than the hot tier's 7-day window, but on cheaper storage, so a bigger request here is
+      # still less costly overall than growing the hot-tier PVC by the same amount.
+      resources:
+        requests:
+          storage: 500Gi
+      storageClassName: standard
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts/-
+  value:
+    name: clickhouse-cold-tier-data
+    mountPath: /var/lib/clickhouse/cold-tier

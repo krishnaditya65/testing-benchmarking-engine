@@ -1,0 +1,35 @@
+# Node / TypeScript
+node_modules/
+dist/
+.next/
+*.tsbuildinfo
+pnpm-lock.yaml.bak
+
+# Go
+services/**/bin/
+services/**/*.exe
+
+# Rust
+target/
+Cargo.lock
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Infra
+infrastructure/terraform/**/.terraform/
+infrastructure/terraform/**/*.tfstate
+infrastructure/terraform/**/*.tfstate.backup
+infrastructure/terraform/**/.terraform.lock.hcl
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Telemetry / local data volumes
+.docker-volumes/

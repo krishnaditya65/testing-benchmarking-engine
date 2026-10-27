@@ -1,0 +1,162 @@
+# Telemetry Lake storage: services/telemetry-lake/clickhouse-schema-migrations
+#
+# Singleton StatefulSet (unlike execution-fleet-worker-deployment.yaml's horizontally-scaled
+# Deployment) because this is the same single-node ClickHouse instance docker-compose.yml runs
+# locally — clustered/sharded ClickHouse is out of scope here (see ARCHITECTURE.md's "Known
+# scope boundaries" and clickhouse-schema-migrations/README.md). A StatefulSet (not a bare
+# Deployment) is still the right primitive even at replicas: 1 because it gives ClickHouse a
+# stable network identity and, more importantly, `volumeClaimTemplates` — the mechanism this
+# file uses to give the hot and cold storage tiers their own distinct PersistentVolumeClaims
+# (see the production overlay's `clickhouse-cold-tier-volume-patch.yaml`).
+#
+# Config wiring: the ConfigMap below embeds
+# services/telemetry-lake/clickhouse-schema-migrations/server-config/storage-policy.xml
+# verbatim and mounts it into /etc/clickhouse-server/config.d/, which is where migration 005
+# (`005_hot_tier_ttl_and_cold_tier_storage_policy.sql`) expects the `hot_to_cold_tiered` storage
+# policy to already be declared before its `ALTER TABLE ... MODIFY SETTING storage_policy`
+# statement can succeed. Keep this ConfigMap's `storage-policy.xml` key in sync with the source
+# file by hand until a CI check or kustomize configMapGenerator replaces this manual copy.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: telemetry-clickhouse-storage-policy
+  namespace: testforge-platform
+  labels:
+    app.kubernetes.io/name: telemetry-metrics-clickhouse
+    app.kubernetes.io/component: telemetry-lake
+    app.kubernetes.io/part-of: distributed-testing-benchmarking-tool
+data:
+  storage-policy.xml: |
+    <!--
+      Mirrors services/telemetry-lake/clickhouse-schema-migrations/server-config/storage-policy.xml
+      verbatim. That file is authoritative — update it first, then copy the change here.
+    -->
+    <clickhouse>
+        <storage_configuration>
+            <disks>
+                <cold_tier_s3>
+                    <type>s3</type>
+                    <endpoint>https://s3.amazonaws.com/testforge-telemetry-cold-tier/</endpoint>
+                    <use_environment_credentials>true</use_environment_credentials>
+                </cold_tier_s3>
+            </disks>
+            <policies>
+                <hot_to_cold_tiered>
+                    <volumes>
+                        <hot>
+                            <disk>default</disk>
+                        </hot>
+                        <cold>
+                            <disk>cold_tier_s3</disk>
+                            <perform_ttl_move_on_insert>0</perform_ttl_move_on_insert>
+                        </cold>
+                    </volumes>
+                    <move_factor>0.1</move_factor>
+                </hot_to_cold_tiered>
+            </policies>
+        </storage_configuration>
+    </clickhouse>
+---
+# Headless Service required by StatefulSet.spec.serviceName; also the DNS name
+# telemetry-query-api and the OTel Collector's ClickHouse exporter resolve
+# (telemetry-metrics-clickhouse.testforge-platform.svc.cluster.local).
+apiVersion: v1
+kind: Service
+metadata:
+  name: telemetry-metrics-clickhouse
+  namespace: testforge-platform
+  labels:
+    app.kubernetes.io/name: telemetry-metrics-clickhouse
+    app.kubernetes.io/component: telemetry-lake
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: telemetry-metrics-clickhouse
+  ports:
+    - name: http
+      port: 8123
+      targetPort: http
+    - name: native
+      port: 9000
+      targetPort: native
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: telemetry-metrics-clickhouse
+  namespace: testforge-platform
+  labels:
+    app.kubernetes.io/name: telemetry-metrics-clickhouse
+    app.kubernetes.io/component: telemetry-lake
+    app.kubernetes.io/part-of: distributed-testing-benchmarking-tool
+spec:
+  serviceName: telemetry-metrics-clickhouse
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: telemetry-metrics-clickhouse
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: telemetry-metrics-clickhouse
+        app.kubernetes.io/component: telemetry-lake
+    spec:
+      serviceAccountName: telemetry-metrics-clickhouse
+      containers:
+        - name: clickhouse-server
+          # Same tag as docker-compose.yml's telemetry-metrics-clickhouse, so local dev and
+          # cluster environments run identical ClickHouse behavior.
+          image: clickhouse/clickhouse-server:24.8-alpine
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          volumeMounts:
+            # Hot tier: the `default` disk migration 005's policy uses for days 0-7. Backed by
+            # the `clickhouse-hot-data` volumeClaimTemplate below.
+            - name: clickhouse-hot-data
+              mountPath: /var/lib/clickhouse
+            - name: storage-policy-config
+              mountPath: /etc/clickhouse-server/config.d/storage-policy.xml
+              subPath: storage-policy.xml
+              readOnly: true
+      volumes:
+        - name: storage-policy-config
+          configMap:
+            name: telemetry-clickhouse-storage-policy
+  volumeClaimTemplates:
+    - metadata:
+        name: clickhouse-hot-data
+        labels:
+          app.kubernetes.io/name: telemetry-metrics-clickhouse
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi
+    # No cold-tier volumeClaimTemplate here: base's storage-policy.xml cold disk is S3-backed
+    # (see `cold_tier_s3` above), so the cold tier does not need a PVC by default. The
+    # production overlay's clickhouse-cold-tier-volume-patch.yaml adds a second,
+    # distinct-from-hot PVC on top of this base for clusters/cloud accounts that pin the cold
+    # tier to on-cluster block storage instead of S3 (see that patch file's comment for why).
+    # Staging intentionally does not apply that patch — see overlays/staging/kustomization.yaml.

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: testforge-platform
+  labels:
+    app.kubernetes.io/part-of: distributed-testing-benchmarking-tool
+    testforge.io/layer: platform
+  annotations:
+    testforge.io/description: >-
+      Hosts the long-lived orchestration-control-plane, execution-fleet, and
+      telemetry-lake workloads. Ephemeral per-run test namespaces are
+      provisioned separately at runtime by environment-lifecycle-manager via
+      the Crossplane composition in infrastructure/crossplane/ — they are
+      never declared here.

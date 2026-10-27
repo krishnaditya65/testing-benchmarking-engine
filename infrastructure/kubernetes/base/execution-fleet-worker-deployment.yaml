@@ -1,0 +1,140 @@
+# Execution Fleet worker: services/execution-fleet/protocol-load-worker-go
+#
+# Stateless REST/gRPC/WebSocket/GraphQL load-generation worker. Scales
+# horizontally on both CPU pressure and the custom "active-virtual-users"
+# metric emitted by dag-workflow-scheduler when it dispatches a load-phase
+# node over the dag.node.dispatch.v1 Redpanda topic, so capacity tracks the
+# concurrency a running pipeline actually asked for, not just host load.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: protocol-load-worker-go
+  namespace: testforge-platform
+  labels:
+    app.kubernetes.io/name: protocol-load-worker-go
+    app.kubernetes.io/component: execution-fleet
+    app.kubernetes.io/part-of: distributed-testing-benchmarking-tool
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: protocol-load-worker-go
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: protocol-load-worker-go
+        app.kubernetes.io/component: execution-fleet
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+    spec:
+      # Workers never accept inbound traffic and never call each other; they
+      # only pull dispatch messages off Redpanda and push telemetry out via
+      # OTLP, so no ingress-facing service account permissions are granted.
+      serviceAccountName: protocol-load-worker-go
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: protocol-load-worker-go
+          image: ghcr.io/testforge/protocol-load-worker-go:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9464
+            - name: healthz
+              containerPort: 8081
+          env:
+            - name: TESTFORGE_REDPANDA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: telemetry-lake-connection
+                  key: redpanda-brokers
+            - name: TESTFORGE_DISPATCH_TOPIC
+              value: dag.node.dispatch.v1
+            - name: TESTFORGE_WORKER_POOL
+              value: protocol-load-worker-go
+            - name: TESTFORGE_OTLP_ENDPOINT
+              value: http://otel-collector.testforge-platform.svc.cluster.local:4317
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: healthz
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: healthz
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          # Workers checkpoint in-flight load-phase state to Redis before
+          # each phase transition (see ARCHITECTURE.md, "Durability by
+          # design") so a spot-instance preemption loses at most one phase
+          # of progress rather than the whole run.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5 && /app/checkpoint-and-drain.sh"]
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 80
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: protocol-load-worker-go
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: protocol-load-worker-go
+  namespace: testforge-platform
+  labels:
+    app.kubernetes.io/name: protocol-load-worker-go
+    app.kubernetes.io/component: execution-fleet
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: protocol-load-worker-go
+  minReplicas: 3
+  maxReplicas: 500
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          # Emitted by dag-workflow-scheduler as it fans out a load-test DAG
+          # node; the KEDA/custom-metrics adapter scrapes this from the
+          # telemetry-query-api aggregation so the fleet pre-scales ahead of
+          # the ramp-up phase instead of reacting after CPU already spiked.
+          name: active-virtual-users
+        target:
+          type: AverageValue
+          averageValue: "250"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
